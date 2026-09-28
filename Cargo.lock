@@ -934,11 +934,14 @@ dependencies = [
  "bstr",
  "camino",
  "clap",
- "litemap",
  "ordered-float",
  "radix_trie",
  "rayon",
 ]
+
+[[package]]
+name = "furl-core"
+version = "0.1.0"
 
 [[package]]
 name = "futures"

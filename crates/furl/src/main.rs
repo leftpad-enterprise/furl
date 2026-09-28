@@ -1,11 +1,11 @@
-use std::cmp::Reverse;
-
 use anyhow::Result;
 use camino::Utf8PathBuf;
 use clap::Parser;
-use litemap::LiteMap;
-use ordered_float::NotNan;
-use radix_trie::{Trie, TrieCommon as _};
+
+use crate::model::{FrequencyModel, Sym};
+
+mod encode;
+mod model;
 
 #[derive(Parser)]
 struct Args {
@@ -14,97 +14,8 @@ struct Args {
     corpus: Utf8PathBuf,
 }
 
-/// A "symbol" in the input stream. Represented as bytes.
-// TODO: is there a better representation, given that we only care about valid URIs?
-#[repr(transparent)]
-#[derive(Copy, Clone)]
-struct Sym(pub u8);
-
-impl From<Sym> for usize {
-    fn from(s: Sym) -> Self {
-        s.0 as usize
-    }
-}
-
-/// Frequency distribution for a given prefix, for a given order.
-#[derive(Clone)]
-struct FreqCtx {
-    // sparse representation of counts for each symbol (byte) that follows the prefix
-    counts: LiteMap<u8, u32>,
-}
-
-impl FreqCtx {
-    fn new() -> Self {
-        FreqCtx {
-            counts: LiteMap::new(),
-        }
-    }
-
-    fn from_sym(sym: Sym) -> Self {
-        Self {
-            counts: LiteMap::from_iter([(sym.0, 1)]),
-        }
-    }
-
-    fn update(&mut self, sym: Sym) {
-        self.counts
-            .entry(sym.0)
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
-    }
-
-    fn distinct(&self) -> u8 {
-        self.counts.len() as u8
-    }
-
-    fn total(&self) -> u32 {
-        self.counts.values().sum()
-    }
-}
-
-impl std::fmt::Debug for FreqCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut exists = self
-            .counts
-            .iter()
-            .filter(|&(_, c)| *c > 0)
-            .map(|(s, c)| (char::from(*s), *c as f64 / self.total() as f64))
-            .collect::<Vec<_>>();
-
-        exists.sort_by_key(|(_, c)| Reverse(NotNan::new(*c).expect("not nan")));
-
-        let vals = exists
-            .iter()
-            .map(|(s, c)| {
-                format!(
-                    "{} {:.2}",
-                    if *s == '\0' {
-                        String::from("\\0")
-                    } else {
-                        s.to_string()
-                    },
-                    c * 100.
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        write!(
-            f,
-            " {{ t {}, d {}, c [{vals}] }}",
-            self.total(),
-            self.distinct()
-        )?;
-
-        Ok(())
-    }
-}
-
-fn parse_freqs<'a>(
-    input: impl Iterator<Item = &'a str>,
-    max_order: usize,
-) -> Trie<Vec<u8>, FreqCtx> {
-    let mut trie = Trie::new();
+fn parse_freqs<'a>(input: impl Iterator<Item = &'a str>, max_order: usize) -> FrequencyModel {
+    let mut freqs = FrequencyModel::new();
 
     for line in input {
         // pad input on left a zero byte and terminate with a zero byte (EOF)
@@ -114,38 +25,64 @@ fn parse_freqs<'a>(
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
 
-        for window in padded.windows(max_order + 1) {
-            // look at each prefix of the window, and update the frequency context for the next symbol
-            for prefix_len in 0..=max_order {
-                // the symbol is the last byte of the window, and the prefix is the preceding `prefix_len` bytes
-                // (for order 0, we simply report the frequency of the symbol itself, with an empty prefix)
-                let sym = Sym(window[max_order]);
-                let prefix = window[max_order - prefix_len..max_order].to_vec();
+        // record the frequency of each symbol for all prefixes of length up to `max_order`
+        for pos in 0..padded.len() {
+            let sym = Sym(padded[pos]);
+            for prefix_len in 0..=max_order.min(pos) {
+                if pos == 0 && prefix_len == 0 {
+                    // don't record the leading zero byte as a symbol in the empty context
+                    continue;
+                }
 
-                trie.map_with_default(
-                    prefix,
-                    |ctx: &mut FreqCtx| ctx.update(sym),
-                    FreqCtx::from_sym(sym),
-                );
+                let prefix = padded[pos - prefix_len..pos].to_vec();
+
+                freqs.update(&prefix, sym);
             }
         }
     }
 
     // input.par_bridge().map();
 
-    trie
+    freqs.finish();
+
+    freqs
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     let input = std::fs::read_to_string(args.corpus)?;
-    let trie = parse_freqs(input.lines().map(str::trim), args.max_order as usize);
+    let freqs = parse_freqs(input.lines().map(str::trim), args.max_order as usize);
 
-    // println!("{:?}", trie);
-    for (prefix, ctx) in trie.iter() {
-        println!("prefix: {:?}, ctx: {:?}", bstr::BStr::new(&prefix), ctx);
+    // println!("{:?}", freqs);
+
+    let s = "\0https://dictionary.cambridge.org/dictionary/english/please\0";
+    let mut bits = 0.0;
+    // *do* encode the terminating zero byte, but not the leading one
+    // (only used for indicating the start of the string in the model)
+    for i in 1..s.len() {
+        let prefix = &s.as_bytes()[i.saturating_sub(args.max_order as usize)..i];
+        let sym = Sym(s.as_bytes()[i]);
+
+        let evs = crate::encode::events_for_symbol(&freqs, prefix, args.max_order as usize, sym);
+        println!(
+            "prefix: {:?}, sym: {:?}, events: {:?}",
+            bstr::BStr::new(prefix),
+            sym.0 as char,
+            evs
+        );
+
+        for ev in evs {
+            bits += ev.entropy();
+        }
     }
+
+    println!(
+        "est. bits to encode: {:.2} ({:.2} bytes, {:.2}% of original)",
+        bits,
+        bits / 8.0,
+        bits / (s.len() * 8) as f64 * 100.0
+    );
 
     Ok(())
 }
