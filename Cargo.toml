@@ -1,0 +1,6 @@
+[workspace]
+members = ["crates/*", "scripts/*"]
+resolver = "3"
+
+[profile.dev]
+opt-level = 1
